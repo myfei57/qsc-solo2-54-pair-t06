@@ -23,7 +23,7 @@ from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import HydroError
 
-DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit")
+DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/api/verify")
 
 
 def _build(args: argparse.Namespace) -> Platform:
@@ -74,6 +74,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     disturbance = platform.disturb_buffer(delta_mpa=-1.0)
     fill = platform.fill(vehicle="vehicle01", rate_kg_per_min=3.0, steps=args.steps)
     stop = platform.stop_fill()
+    verification = platform.verify_run(operator="demo", meter_rate_kg_per_min=3.0, reference_rate_kg_per_min=3.0)
     cycles = [platform.cycle(dt=1.0) for _ in range(6)]
     leak = platform.sample_leak(concentration_ppm=4200.0)
     clock.advance(config.leak.hold_s + 1.0)
@@ -95,6 +96,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "disturbance": disturbance,
         "fill": {"ok": fill["ok"], "steps": [step["action"] for step in fill["steps"]]},
         "stop": {"ok": stop["ok"], "steps": [step["action"] for step in stop["steps"]]},
+        "verification": {
+            "conclusive": verification["conclusive"],
+            "conclusion": verification["conclusion"],
+            "version": verification["criteria"]["version"],
+            "max_deviation_pct": verification["max_deviation_pct"],
+        },
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "leak": leak,
@@ -112,6 +119,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             failures.extend(operation["violations"])
     if not stop["ok"]:
         failures.append("stop_fill_not_completed")
+    if not verification["conclusive"] or verification["conclusion"] != "pass":
+        failures.append("verify_not_passed")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

@@ -40,7 +40,7 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
-from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
+from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck, verify_flow
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
 from .telemetry import TrendBuffer
@@ -48,9 +48,13 @@ from .truck.machine import TruckMachine
 from .vent.latch import VentLatch
 from .vent.snapshot import VentSnapshot
 from .vent.valve import VentValve
+from .verify.ledger import VerifyLedger
+from .verify.policy import ON_FAIL_BLOCK, VerifyCriteria
+from .verify.reference import ReferenceLeg
 
 DEFAULT_UNIT = "station1"
 DEFAULT_VEHICLE = "vehicle01"
+DEFAULT_POINT = "station.flowmeter"
 
 
 class Platform:
@@ -103,6 +107,10 @@ class Platform:
         self.leak_latch = LeakLatch(self.config.leak.hold_s)
         self.queue = FillQueue(self.config.queue)
         self.confirm = Confirmation(self.config.queue.confirm_timeout_s)
+        self.reference = ReferenceLeg(self.config.verify)
+        self.verify_ledger = VerifyLedger(JsonlJournal(store.root, "flow_verify", segment_limit=256))
+        self._verify_criteria = VerifyCriteria.from_limits(self.config.verify)
+        self.verify_ids = IdFactory("vfy")
 
         self._cycles = 0
         self._operations = 0
@@ -189,6 +197,10 @@ class Platform:
             "ok": bool(report.get("ok")),
             "violations": list(report.get("violations", [])),
         }
+        # 加注报告携带的校验状态一并进审计汇总，加注记录与校验记录按 run_id 互查。
+        verification = report.get("verification")
+        if verification:
+            summary["verification"] = verification
         self.bus.publish(
             Event.of(
                 "audit",
@@ -279,6 +291,46 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            verification = self._verify_standing()
+            if verification["conclusion"] == "fail":
+                if verification["on_fail"] == ON_FAIL_BLOCK:
+                    # 计量点策略为拦下：校验不合格期间不允许发起加注。
+                    self.bus.publish(
+                        Event.of(
+                            "flow",
+                            "flow",
+                            "fill_blocked_verify",
+                            station=self.unit,
+                            op_id=op_id,
+                            severity="alarm",
+                            message=f"计量点 {DEFAULT_POINT} 校验不合格，加注被拦下",
+                            point=DEFAULT_POINT,
+                            run_id=verification["run_id"],
+                            version=verification["version"],
+                        )
+                    )
+                    return {
+                        "station": self.unit,
+                        "vehicle": vehicle,
+                        "ok": False,
+                        "violations": ["meter_unqualified"],
+                        "verification": verification,
+                    }
+                # 计量点策略为提示：加注照常进行，但提示必须落审计。
+                self.bus.publish(
+                    Event.of(
+                        "flow",
+                        "flow",
+                        "fill_verify_warning",
+                        station=self.unit,
+                        op_id=op_id,
+                        severity="warning",
+                        message=f"计量点 {DEFAULT_POINT} 校验不合格，按计量点策略仅提示",
+                        point=DEFAULT_POINT,
+                        run_id=verification["run_id"],
+                        version=verification["version"],
+                    )
+                )
             try:
                 self.dispenser.check_line_pressure(self.bank.pressure_mpa)
             except HydroError as error:
@@ -300,6 +352,7 @@ class Platform:
                 now=self.clock.now(),
                 dt=dt,
             )
+            report["verification"] = verification
             if report["ok"]:
                 try:
                     self.bank.draw(self.meter.total_kg() - before)
@@ -379,6 +432,199 @@ class Platform:
             "within_band": self.bank.within_band(),
         }
 
+    def _verify_on_fail(self, point: str) -> str:
+        """返回某计量点超差后的处置动作（拦下或提示）。"""
+
+        return self.config.verify.points.get(point, self.config.verify.on_fail)
+
+    def _verify_standing(self, point: str = DEFAULT_POINT) -> dict:
+        """返回加注门禁要核对的校验状态（最近一条出了结论的记录）。"""
+
+        standing = self.verify_ledger.latest_conclusive(point)
+        return {
+            "point": point,
+            "on_fail": self._verify_on_fail(point),
+            "conclusion": standing["conclusion"] if standing else None,
+            "run_id": standing["run_id"] if standing else None,
+            "version": standing["criteria"]["version"] if standing else None,
+        }
+
+    def verify_run(
+        self,
+        operator: str,
+        point: str = DEFAULT_POINT,
+        meter_rate_kg_per_min: float = 3.0,
+        reference_rate_kg_per_min: float = 3.0,
+        dt: float = 36.0,
+    ) -> dict:
+        """执行一次流量计在线校验：被校表与参照路分段比对，出结论或作废。
+
+        每次运行都登记操作人并落台账与审计；参照路异常属于部分失败，本次
+        只留记录不出结论，计量点既有合格状态不变。
+        """
+
+        with self._lock:
+            operator = str(operator).strip()
+            if not operator:
+                raise HydroError("校验必须登记操作人", component="verify")
+            if point != DEFAULT_POINT:
+                raise HydroError(f"计量点未接入校验回路: {point}", component="verify")
+            run_id = self.verify_ids.next()
+            report = verify_flow(
+                self.meter,
+                self.reference,
+                self._verify_criteria,
+                meter_rate_kg_per_min,
+                reference_rate_kg_per_min,
+                dt,
+            )
+            record = {
+                "kind": "run",
+                "run_id": run_id,
+                "ts": round(self.clock.now(), 3),
+                "station": self.unit,
+                "point": point,
+                "operator": operator,
+                "criteria": self._verify_criteria.as_dict(),
+                "segments": report["segments"],
+                "max_deviation_pct": report["max_deviation_pct"],
+                "conclusive": report["conclusive"],
+                "conclusion": report["conclusion"],
+                "reason": report["reason"],
+            }
+            self.verify_ledger.append_run(record)
+            if not report["conclusive"]:
+                action = "verify_inconclusive"
+                severity = "warning"
+                message = f"校验未出结论：{report['message'] or report['reason']}"
+            elif report["conclusion"] == "pass":
+                action = "verify_pass"
+                severity = "notice"
+                message = "校验合格"
+            else:
+                action = "verify_fail"
+                severity = "alarm"
+                message = "校验超差，判定不合格"
+            self.bus.publish(
+                Event.of(
+                    "flow",
+                    "flow",
+                    action,
+                    station=self.unit,
+                    op_id=run_id,
+                    severity=severity,
+                    message=message,
+                    point=point,
+                    operator=operator,
+                    version=self._verify_criteria.version,
+                    conclusion=report["conclusion"],
+                    max_deviation_pct=report["max_deviation_pct"],
+                )
+            )
+            return {**record, "status": self.verify_ledger.status(point, self._verify_on_fail(point))}
+
+    def verify_migrate(
+        self,
+        operator: str,
+        version: str,
+        tolerance_pct: float | None = None,
+        segments: int | None = None,
+        segment_target_kg: float | None = None,
+        reason: str = "",
+    ) -> dict:
+        """迁移校验判定版本：换版是显式登记的操作，历史结论按当时那一版解释。
+
+        迁移只影响之后的校验；计量点既有合格状态沿用最近一条出了结论的
+        记录（按它自己的版本解释），直到下一次出结论的校验覆盖它。
+        """
+
+        with self._lock:
+            operator = str(operator).strip()
+            if not operator:
+                raise HydroError("迁移必须登记操作人", component="verify")
+            current = self._verify_criteria
+            new = VerifyCriteria.create(
+                version=version,
+                segments=current.segments if segments is None else segments,
+                segment_target_kg=current.segment_target_kg if segment_target_kg is None else segment_target_kg,
+                tolerance_pct=current.tolerance_pct if tolerance_pct is None else tolerance_pct,
+            )
+            if new.version == current.version:
+                raise HydroError(f"判定版本未变化（{current.version}），不属于迁移", component="verify")
+            record = {
+                "kind": "migration",
+                "run_id": self.verify_ids.next(),
+                "ts": round(self.clock.now(), 3),
+                "station": self.unit,
+                "operator": operator,
+                "from_version": current.version,
+                "to_version": new.version,
+                "criteria": new.as_dict(),
+                "reason": str(reason),
+            }
+            self.verify_ledger.append_migration(record)
+            self._verify_criteria = new
+            self.bus.publish(
+                Event.of(
+                    "flow",
+                    "flow",
+                    "verify_migrated",
+                    station=self.unit,
+                    op_id=record["run_id"],
+                    severity="notice",
+                    message=f"校验判定版本迁移：{record['from_version']} → {record['to_version']}",
+                    operator=operator,
+                    from_version=record["from_version"],
+                    to_version=record["to_version"],
+                )
+            )
+            return record
+
+    def verify_status(self, point: str | None = None) -> dict:
+        """汇总校验状态：生效判定准则、参照路健康与各计量点合格状态。"""
+
+        points = [str(point)] if point else sorted({DEFAULT_POINT, *self.config.verify.points})
+        return {
+            "active_criteria": self._verify_criteria.as_dict(),
+            "reference": {
+                "faulted": bool(self.reference.fault_reason()),
+                "reason": self.reference.fault_reason(),
+            },
+            "points": [self.verify_ledger.status(item, self._verify_on_fail(item)) for item in points],
+        }
+
+    def verify_history(self, point: str | None = None, limit: int = 50) -> list[dict]:
+        """返回校验历史（运行与迁移记录，最新的在前），供控制台展示。"""
+
+        return self.verify_ledger.history(point=point, limit=limit)
+
+    def fault_reference(self, reason: str = "manual_drill") -> dict:
+        """注入参照路故障（演练用）；此后的校验运行将按部分失败作废。"""
+
+        with self._lock:
+            self.reference.trip_fault(reason)
+            self.bus.publish(
+                Event.of(
+                    "flow",
+                    "flow",
+                    "reference_fault_tripped",
+                    station=self.unit,
+                    severity="warning",
+                    reason=self.reference.fault_reason(),
+                )
+            )
+            return {"faulted": True, "reason": self.reference.fault_reason()}
+
+    def clear_reference_fault(self) -> dict:
+        """清除参照路故障。"""
+
+        with self._lock:
+            self.reference.clear_fault()
+            self.bus.publish(
+                Event.of("flow", "flow", "reference_fault_cleared", station=self.unit, severity="notice")
+            )
+            return {"faulted": False, "reason": ""}
+
     def enqueue_vehicle(self, vehicle: str) -> dict:
         """把车辆加入加注队列，返回排队位次。"""
 
@@ -404,6 +650,7 @@ class Platform:
         """汇总加注就绪判据，供控制台与巡检使用。"""
 
         fill_stage = self.topology.stage("fill")
+        verification = self._verify_standing()
         checks = {
             "running": self._running,
             "precool_ready": self.precooler.is_ready(),
@@ -411,6 +658,9 @@ class Platform:
             "nozzle_latched": self.nozzle.is_latched(),
             "leak_latch_clear": not self.leak_latch.is_engaged(self.clock.now()),
             "confirm_idle": not self.confirm.pending(DEFAULT_VEHICLE),
+            "flow_verify_clear": not (
+                verification["conclusion"] == "fail" and verification["on_fail"] == ON_FAIL_BLOCK
+            ),
         }
         recent = self.audit.tail(1)
         return {
@@ -531,6 +781,8 @@ class Platform:
             self.leak.reset()
             self.dispenser.reset()
             self.queue.reset()
+            self.reference.reset()
+            self.reference.clear_fault()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
             self._operations = 0
             self._cycles = 0
@@ -661,6 +913,7 @@ class Platform:
             "disp": self.disp_snapshot(),
             "leak": self.leak_snapshot(),
             "queue": self.queue_snapshot(),
+            "verify": self.verify_status(),
             "setpoint": {
                 "committed_mpa": round(self.setpoint.committed(), 3),
                 "writers": self.setpoint.writers(),

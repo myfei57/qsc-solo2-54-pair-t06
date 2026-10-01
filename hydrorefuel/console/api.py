@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from ..app import Platform
+from ..app import DEFAULT_POINT, Platform
 from ..audit.timeline import build_timeline
 from ..errors import HydroError
 from .router import Router
@@ -50,6 +50,8 @@ class Api:
         add("GET", "/api/disp", lambda params, body: {"disp": self._platform.disp_snapshot()})
         add("GET", "/api/leak", lambda params, body: {"leak": self._platform.leak_snapshot()})
         add("GET", "/api/queue", lambda params, body: {"queue": self._platform.queue_snapshot()})
+        add("GET", "/api/verify", lambda params, body: {"verify": self._platform.verify_status()})
+        add("GET", "/api/verify/history", self._verify_history)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
         add("GET", "/api/events", self._events)
@@ -69,6 +71,9 @@ class Api:
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/dequeue", lambda params, body: self._platform.dequeue_vehicle())
         add("POST", "/api/concurrency", self._concurrency)
+        add("POST", "/api/verify/run", self._verify_run)
+        add("POST", "/api/verify/migrate", self._verify_migrate)
+        add("POST", "/api/verify/reference", self._verify_reference)
         add("POST", "/api/reset", lambda params, body: self._platform.reset_state())
 
     def routes(self) -> list[dict]:
@@ -184,3 +189,35 @@ class Api:
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+
+    def _verify_history(self, params: dict, body: dict) -> dict:
+        point = params.get("point") or None
+        return {"records": self._platform.verify_history(point=point, limit=int(params.get("limit", 50)))}
+
+    def _verify_run(self, params: dict, body: dict) -> dict:
+        return self._platform.verify_run(
+            operator=str(body.get("operator", "")),
+            point=str(body.get("point", DEFAULT_POINT)),
+            meter_rate_kg_per_min=_as_float(body, "meter_rate_kg_per_min", 3.0),
+            reference_rate_kg_per_min=_as_float(body, "reference_rate_kg_per_min", 3.0),
+            dt=_as_float(body, "dt", 36.0),
+        )
+
+    def _verify_migrate(self, params: dict, body: dict) -> dict:
+        overrides: dict = {}
+        for key in ("tolerance_pct", "segment_target_kg"):
+            if key in body:
+                overrides[key] = _as_float(body, key, 0.0)
+        if "segments" in body:
+            overrides["segments"] = int(body["segments"])
+        return self._platform.verify_migrate(
+            operator=str(body.get("operator", "")),
+            version=str(body.get("version", "")),
+            reason=str(body.get("reason", "")),
+            **overrides,
+        )
+
+    def _verify_reference(self, params: dict, body: dict) -> dict:
+        if body.get("fault"):
+            return self._platform.fault_reference(str(body.get("reason", "console_drill")))
+        return self._platform.clear_reference_fault()

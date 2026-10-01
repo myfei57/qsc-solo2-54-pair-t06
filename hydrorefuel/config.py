@@ -2,7 +2,8 @@
 
 配置来自 JSON 文件（标准库解析），覆盖槽车卸氢压力与放散确认阈值、压缩机
 入口与目标压力、瓶组压力带与基线有效期、预冷目标温度、流量阶梯公差、加注
-枪落座行程、泄漏阀值与加注队列容量。任何缺失或越界取值都在装配阶段抛出
+枪落座行程、泄漏阀值、加注队列容量，以及流量计在线校验的判定准则、参照路
+速率区间与各计量点的超差动作。任何缺失或越界取值都在装配阶段抛出
 :class:`ConfigError`，不允许带着半份配置启动控制链。
 """
 
@@ -48,6 +49,28 @@ def _integer(section: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
     if value < minimum:
         raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
     return value
+
+
+def _text(section: Mapping[str, Any], key: str) -> str:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"配置字段 {key!r} 必须是非空字符串", component="config")
+    return value.strip()
+
+
+def _on_fail_actions(value: Any) -> dict:
+    if not isinstance(value, Mapping):
+        raise ConfigError("verify.points 必须是映射", component="config")
+    points: dict[str, str] = {}
+    for point, action in value.items():
+        if not isinstance(point, str) or not point:
+            raise ConfigError("计量点名称必须是非空字符串", component="config")
+        if action not in ("block", "warn"):
+            raise ConfigError(f"计量点 {point} 的超差动作只能是 block 或 warn", component="config")
+        points[point] = action
+    return points
 
 
 @dataclass(frozen=True)
@@ -275,6 +298,38 @@ class QueueLimits:
 
 
 @dataclass(frozen=True)
+class VerifyLimits:
+    """流量计在线校验判定准则、参照路速率与计量点超差动作约束。"""
+
+    criteria_version: str
+    segments: int
+    segment_target_kg: float
+    tolerance_pct: float
+    ref_min_rate_kg_per_min: float
+    ref_max_rate_kg_per_min: float
+    on_fail: str
+    points: Mapping[str, str]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "VerifyLimits":
+        limits = cls(
+            criteria_version=_text(section, "criteria_version"),
+            segments=_integer(section, "segments", minimum=1),
+            segment_target_kg=_number(section, "segment_target_kg", minimum=0.1),
+            tolerance_pct=_number(section, "tolerance_pct", minimum=0.01),
+            ref_min_rate_kg_per_min=_number(section, "ref_min_rate_kg_per_min", minimum=0.01),
+            ref_max_rate_kg_per_min=_number(section, "ref_max_rate_kg_per_min", minimum=0.1),
+            on_fail=_text(section, "on_fail"),
+            points=_on_fail_actions(section.get("points", {})),
+        )
+        if limits.ref_min_rate_kg_per_min >= limits.ref_max_rate_kg_per_min:
+            raise ConfigError("参照路速率下限必须小于上限", component="config")
+        if limits.on_fail not in ("block", "warn"):
+            raise ConfigError("on_fail 只能是 block 或 warn", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """一份完整的平台配置。"""
 
@@ -289,6 +344,7 @@ class StationConfig:
     dispenser: DispenserLimits
     leak: LeakLimits
     queue: QueueLimits
+    verify: VerifyLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -313,6 +369,7 @@ class StationConfig:
             dispenser=DispenserLimits.from_mapping(_section(limits, "disp")),
             leak=LeakLimits.from_mapping(_section(limits, "leak")),
             queue=QueueLimits.from_mapping(_section(limits, "queue")),
+            verify=VerifyLimits.from_mapping(_section(limits, "verify")),
         )
 
 
@@ -343,6 +400,7 @@ def default_config() -> StationConfig:
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
         queue=QueueLimits(12, 45.0),
+        verify=VerifyLimits("v1", 3, 1.8, 1.5, 0.2, 6.0, "block", {"station.flowmeter": "block"}),
     )
 
 
@@ -403,6 +461,16 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+            },
+            "verify": {
+                "criteria_version": cfg.verify.criteria_version,
+                "segments": cfg.verify.segments,
+                "segment_target_kg": cfg.verify.segment_target_kg,
+                "tolerance_pct": cfg.verify.tolerance_pct,
+                "ref_min_rate_kg_per_min": cfg.verify.ref_min_rate_kg_per_min,
+                "ref_max_rate_kg_per_min": cfg.verify.ref_max_rate_kg_per_min,
+                "on_fail": cfg.verify.on_fail,
+                "points": dict(cfg.verify.points),
             },
         },
     }

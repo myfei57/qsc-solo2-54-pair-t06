@@ -55,6 +55,18 @@
     "queue": {
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
+    },
+    "verify": {
+      "criteria_version": "v1",
+      "segments": 3,
+      "segment_target_kg": 1.8,
+      "tolerance_pct": 1.5,
+      "ref_min_rate_kg_per_min": 0.2,
+      "ref_max_rate_kg_per_min": 6.0,
+      "on_fail": "block",
+      "points": {
+        "station.flowmeter": "block"
+      }
     }
   }
 }
