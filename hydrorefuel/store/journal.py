@@ -97,6 +97,20 @@ class JsonlJournal:
         with self._lock:
             return self._count
 
+    def clear(self) -> int:
+        """删除全部段文件并归零，返回删除的记录条数（平台重置用）。"""
+
+        with self._lock:
+            removed = self._count
+            for path in self.segments():
+                try:
+                    os.remove(path)
+                except OSError as error:
+                    raise StorageError(f"清空流水失败: {error}", component="store") from error
+            self._count = 0
+            self._segment = 0
+            return removed
+
     def active_segment(self) -> int:
         """返回当前正在写入的段号。"""
 

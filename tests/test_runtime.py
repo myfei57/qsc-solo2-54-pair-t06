@@ -33,7 +33,7 @@ def test_concurrency_probe_converges(platform):
 
 def test_namespace_resolution(platform):
     assert platform.namespace("station.vent")["kind"] == "vent-valve"
-    assert platform.namespaces_describe()["count"] == 10
+    assert platform.namespaces_describe()["count"] == 12
 
 
 def test_reset_state_clears_counts(platform):

@@ -47,6 +47,15 @@ class Api:
         add("GET", "/api/buffer", lambda params, body: {"buffer": self._platform.buffer_snapshot()})
         add("GET", "/api/cool", lambda params, body: {"cool": self._platform.cool_snapshot()})
         add("GET", "/api/flow", lambda params, body: {"flow": self._platform.flow_snapshot()})
+        add("GET", "/api/calib", lambda params, body: self._platform.calib_snapshot())
+        add("GET", "/api/calib/history", self._calib_history)
+        add("GET", "/api/calib/fills", self._calib_fills)
+        add("GET", "/api/calib/reconcile", lambda params, body: self._platform.calib_reconciliation())
+        add("POST", "/api/calib/point", self._calib_point)
+        add("POST", "/api/calib/verify", self._calib_verify)
+        add("POST", "/api/calib/rule", self._calib_rule)
+        add("POST", "/api/calib/reference/fault", self._calib_ref_fault)
+        add("POST", "/api/calib/reference/recover", lambda params, body: self._platform.recover_reference(str(body.get("operator", ""))))
         add("GET", "/api/disp", lambda params, body: {"disp": self._platform.disp_snapshot()})
         add("GET", "/api/leak", lambda params, body: {"leak": self._platform.leak_snapshot()})
         add("GET", "/api/queue", lambda params, body: {"queue": self._platform.queue_snapshot()})
@@ -163,6 +172,9 @@ class Api:
             rate_kg_per_min=_as_float(body, "rate_kg_per_min", 3.0),
             steps=int(body.get("steps", 3)),
             dt=_as_float(body, "dt", 36.0),
+            point_id=str(body.get("point_id", "")),
+            operator=str(body.get("operator", "")),
+            acknowledged=bool(body.get("acknowledged", False)),
         )
 
     def _stop(self, params: dict, body: dict) -> dict:
@@ -176,11 +188,50 @@ class Api:
             _as_float(body, "target_mpa", self._platform.baseline.target_mpa)
         )
 
+    def _calib_history(self, params: dict, body: dict) -> dict:
+        point_id = params.get("point_id") or None
+        return self._platform.calib_history(point_id=point_id, limit=int(params.get("limit", 100)))
+
+    def _calib_fills(self, params: dict, body: dict) -> dict:
+        point_id = params.get("point_id") or None
+        return self._platform.fill_gate_history(point_id=point_id, limit=int(params.get("limit", 100)))
+
+    def _calib_point(self, params: dict, body: dict) -> dict:
+        return self._platform.register_metering_point(
+            operator=str(body.get("operator", "")),
+            point_id=str(body.get("point_id", "")),
+            flowmeter=str(body.get("flowmeter", "")),
+            fail_policy=str(body.get("fail_policy", "block")),
+        )
+
+    def _calib_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.verify_meter(
+            operator=str(body.get("operator", "")),
+            point_id=str(body.get("point_id", "")),
+            target_kg=_as_float(body, "target_kg", 5.0),
+            dut_bias_pct=_as_float(body, "dut_bias_pct", 0.0),
+        )
+
+    def _calib_rule(self, params: dict, body: dict) -> dict:
+        return self._platform.activate_calib_rule(
+            operator=str(body.get("operator", "")),
+            version=str(body.get("version", "")),
+            method=str(body.get("method", "same_quantity_single_pass")),
+            mpe_pct=None if body.get("mpe_pct") is None else _as_float(body, "mpe_pct", 0.0),
+            min_charge_kg=None if body.get("min_charge_kg") is None else _as_float(body, "min_charge_kg", 0.0),
+            valid_ttl_s=None if body.get("valid_ttl_s") is None else _as_float(body, "valid_ttl_s", 0.0),
+        )
+
+    def _calib_ref_fault(self, params: dict, body: dict) -> dict:
+        return self._platform.mark_reference_fault(
+            operator=str(body.get("operator", "")),
+            reason=str(body.get("reason", "reference_fault")),
+        )
+
     def _disturb(self, params: dict, body: dict) -> dict:
         return self._platform.disturb_buffer(_as_float(body, "delta_mpa", 0.0))
 
     def _enqueue(self, params: dict, body: dict) -> dict:
         return self._platform.enqueue_vehicle(str(body.get("vehicle", "vehicle01")))
-
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))

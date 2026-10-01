@@ -53,3 +53,7 @@ class ConfigError(HydroError):
 
 class NamespaceError(HydroError):
     """命名空间重复注册或解析失败。"""
+
+
+class CalibError(HydroError):
+    """在线校验条件不满足或计量点状态非法。"""

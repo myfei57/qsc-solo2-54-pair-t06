@@ -16,6 +16,7 @@ from .audit.record import AuditRecord
 from .buffer.bank import BufferBank
 from .buffer.baseline import BufferBaseline
 from .buffer.snapshot import BufferSnapshot
+from .calib.service import CalibService
 from .clock import Clock, SystemClock
 from .comp.machine import Compressor
 from .comp.surge import SurgeGuard
@@ -74,7 +75,6 @@ class Platform:
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
         self.ids = IdFactory("op")
-
         self.truck = TruckMachine(self.config.truck)
         self.vent = VentValve(self.config.vent)
         self.vent_latch = VentLatch(self.config.vent.latch_travel_mm)
@@ -92,6 +92,16 @@ class Platform:
         self.precooler = Precooler(self.config.cool)
         self.meter = MassFlowMeter(self.config.flow)
         self.flow_step = FlowStep(self.config.flow)
+        self.calib = CalibService(
+            self.clock,
+            self.bus,
+            self.config.flow,
+            self.config.calib,
+            store,
+            JsonlJournal(store.root, "calib", segment_limit=512),
+            JsonlJournal(store.root, "fillgate", segment_limit=512),
+            self.audit.journal,
+        )
         self.nozzle = Nozzle(self.config.dispenser.nozzle_seat_travel_mm)
         self.dispenser = Dispenser(self.config.dispenser, self.nozzle)
         self.setpoint = SetpointArbiter(
@@ -124,6 +134,8 @@ class Platform:
             ("station", "dispenser", "fill-dispenser"),
             ("station", "nozzle", "fill-nozzle"),
             ("station", "flowmeter", "mass-flow-meter"),
+            ("station", "reference_meter", "reference-standard-meter"),
+            ("station", "calib", "meter-verification"),
             ("station", "leak", "leak-detector"),
             ("station", "queue", "fill-queue"),
         ):
@@ -274,11 +286,40 @@ class Platform:
         rate_kg_per_min: float = 3.0,
         steps: int = 3,
         dt: float = 36.0,
+        point_id: str = "",
+        operator: str = "",
+        acknowledged: bool = False,
     ) -> dict:
-        """加注编排：队列确认 → 枪落座 → 预冷 → 加注 → 隔离停机 → 枪回位。"""
+        """加注编排：计量门禁 → 队列确认 → 枪落座 → 预冷 → 加注 → 隔离停机 → 枪回位。
+
+        指定 ``point_id`` 时先走在线校验门禁：不合格按计量点策略当场拦下或
+        要求操作员确认后放行；拦下时不发起加注。未指定计量点时保持原有
+        编排（与计量无关的演练/测试路径）。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            gate: dict | None = None
+            if point_id:
+                gate = self.calib.gate_fill(
+                    operator=operator,
+                    point_id=point_id,
+                    vehicle=vehicle,
+                    acknowledged=acknowledged,
+                )
+                if gate["decision"] != "allowed":
+                    report = {
+                        "station": self.unit,
+                        "vehicle": vehicle,
+                        "ok": False,
+                        "steps": [],
+                        "violations": [f"calib_gate_{gate['decision']}"],
+                        "op_id": op_id,
+                        "gate": gate,
+                    }
+                    self._operations += 1
+                    self._persist()
+                    return report
             try:
                 self.dispenser.check_line_pressure(self.bank.pressure_mpa)
             except HydroError as error:
@@ -300,6 +341,8 @@ class Platform:
                 now=self.clock.now(),
                 dt=dt,
             )
+            if report["ok"] and gate is not None:
+                self.calib.attach_fill_op(gate["record_id"], op_id)
             if report["ok"]:
                 try:
                     self.bank.draw(self.meter.total_kg() - before)
@@ -308,6 +351,8 @@ class Platform:
             summary = self._record_operation(op_id, "fill", report)
             self._operations += 1
             self._persist()
+            if gate is not None:
+                report["gate"] = gate
             return {**report, **summary}
 
     def stop_fill(self) -> dict:
@@ -367,6 +412,83 @@ class Platform:
                 )
             )
             return {"before_mpa": before, "after_mpa": after, "epoch": self.baseline.epoch}
+
+    def register_metering_point(
+        self, operator: str, point_id: str, flowmeter: str, fail_policy: str = "block"
+    ) -> dict:
+        """登记计量点与其超差处置策略（block 当场拦下 / warn 给提示）。"""
+
+        with self._lock:
+            return self.calib.register_point(operator, point_id, flowmeter, fail_policy)
+
+    def verify_meter(
+        self,
+        operator: str,
+        point_id: str,
+        target_kg: float,
+        dut_bias_pct: float = 0.0,
+    ) -> dict:
+        """对计量点跑一遍同量在线校验，返回校验记录。"""
+
+        with self._lock:
+            return self.calib.run_verification(operator, point_id, target_kg, dut_bias_pct=dut_bias_pct)
+
+    def mark_reference_fault(self, operator: str, reason: str = "reference_fault") -> dict:
+        """置参照路异常；异常期间校验只出部分失败、不出结论。"""
+
+        with self._lock:
+            return self.calib.mark_reference_fault(operator, reason)
+
+    def recover_reference(self, operator: str) -> dict:
+        """显式恢复参照路。"""
+
+        with self._lock:
+            return self.calib.recover_reference(operator)
+
+    def activate_calib_rule(
+        self,
+        operator: str,
+        version: str,
+        method: str = "same_quantity_single_pass",
+        mpe_pct: float | None = None,
+        min_charge_kg: float | None = None,
+        valid_ttl_s: float | None = None,
+    ) -> dict:
+        """登记并激活校验规则版本；激活不同版本即一次迁移。"""
+
+        with self._lock:
+            return self.calib.activate_rule(
+                operator,
+                version,
+                method=method,
+                mpe_pct=mpe_pct,
+                min_charge_kg=min_charge_kg,
+                valid_ttl_s=valid_ttl_s,
+            )
+
+    def calib_history(self, point_id: str | None = None, limit: int = 100) -> dict:
+        """返回校验历史（可按计量点过滤），供控制台展示。"""
+
+        with self._lock:
+            return {"records": self.calib.history(point_id=point_id, limit=limit)}
+
+    def fill_gate_history(self, point_id: str | None = None, limit: int = 100) -> dict:
+        """返回加注门禁历史（可按计量点过滤）。"""
+
+        with self._lock:
+            return {"records": self.calib.fill_history(point_id=point_id, limit=limit)}
+
+    def calib_reconciliation(self) -> dict:
+        """校验记录、加注记录与审计三方对账。"""
+
+        with self._lock:
+            return self.calib.reconciliation()
+
+    def calib_snapshot(self) -> dict:
+        """返回在线校验整体快照。"""
+
+        with self._lock:
+            return self.calib.snapshot().as_dict()
 
     def disturb_buffer(self, delta_mpa: float) -> dict:
         """模拟一次瓶组压力扰动，返回扰动后的压力。"""
@@ -531,10 +653,18 @@ class Platform:
             self.leak.reset()
             self.dispenser.reset()
             self.queue.reset()
+            self.calib.reset()
+            calib_cleared = self.calib.journal.clear()
+            fill_cleared = self.calib.fill_journal.clear()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
             self._operations = 0
             self._cycles = 0
-            return {"platform_state_removed": removed, "store_root": self.store.root}
+            return {
+                "platform_state_removed": removed,
+                "calib_records_cleared": calib_cleared,
+                "fill_records_cleared": fill_cleared,
+                "store_root": self.store.root,
+            }
 
     def truck_snapshot(self) -> dict:
         """返回槽车状态快照。"""
@@ -658,6 +788,7 @@ class Platform:
             "buffer": self.buffer_snapshot(),
             "cool": self.cool_snapshot(),
             "flow": self.flow_snapshot(),
+            "calib": self.calib_snapshot(),
             "disp": self.disp_snapshot(),
             "leak": self.leak_snapshot(),
             "queue": self.queue_snapshot(),

@@ -80,6 +80,19 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     leak_reset = platform.release_leak()
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     calibration = platform.calibrate_baseline(target_mpa=42.0)
+
+    # 在线校验全链路：登记计量点（block 策略）→ 同量校验合格 → 凭结论加注；
+    # 再注入超差跑一遍，演示超差记录与当场拦下；参照路异常演示不出结论。
+    operator = "demo-operator"
+    point = platform.register_metering_point(operator, "MP-01", "station.flowmeter", "block")
+    verify_pass = platform.verify_meter(operator, "MP-01", target_kg=5.0)
+    gated_fill = platform.fill(vehicle="vehicle02", steps=1, point_id="MP-01", operator=operator)
+    verify_fail = platform.verify_meter(operator, "MP-01", target_kg=5.0, dut_bias_pct=3.0)
+    blocked_fill = platform.fill(vehicle="vehicle03", steps=1, point_id="MP-01", operator=operator)
+    reference_fault = platform.mark_reference_fault(operator)
+    inconclusive = platform.verify_meter(operator, "MP-01", target_kg=5.0)
+    reference_recovered = platform.recover_reference(operator)
+    reconciliation = platform.calib_reconciliation()
     shutdown = platform.stop()
 
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
@@ -101,6 +114,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "leak_reset": leak_reset,
         "concurrency": concurrency,
         "calibration": calibration,
+        "meter_point": point,
+        "meter_verify_pass": verify_pass,
+        "meter_gated_fill_ok": gated_fill["ok"],
+        "meter_verify_fail": {"conclusion": verify_fail["conclusion"], "deviation_pct": verify_fail["deviation_pct"]},
+        "meter_blocked_fill": {"ok": blocked_fill["ok"], "violations": blocked_fill["violations"]},
+        "meter_reference_fault": reference_fault,
+        "meter_inconclusive": {"conclusion": inconclusive["conclusion"], "status": inconclusive["status"]},
+        "meter_reference_recovered": reference_recovered,
+        "meter_reconciliation": reconciliation,
         "shutdown": shutdown,
         "probe": probe,
         "audit": platform.audit.summary(),

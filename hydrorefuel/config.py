@@ -213,6 +213,31 @@ class FlowLimits:
 
 
 @dataclass(frozen=True)
+class CalibLimits:
+    """在线校验的默认计量阈值与结论有效期。
+
+    校验方式本身不在配置里可选——首版定死为"同量走一遍"（见
+    ``hydrorefuel.calib.rule`` 的方法码）；这里只放数值口径，换数值或换
+    方式都通过规则版本迁移完成，不允许在配置里悄悄改方法。
+    """
+
+    mpe_pct: float
+    min_charge_kg: float
+    valid_ttl_s: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "CalibLimits":
+        limits = cls(
+            mpe_pct=_number(section, "mpe_pct", minimum=0.01),
+            min_charge_kg=_number(section, "min_charge_kg", minimum=0.1),
+            valid_ttl_s=_number(section, "valid_ttl_s", minimum=1.0),
+        )
+        if limits.mpe_pct > 100.0:
+            raise ConfigError("最大允许偏差不得超过 100%", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class DispenserLimits:
     """加注机枪位、落座与隔离约束。"""
 
@@ -289,6 +314,7 @@ class StationConfig:
     dispenser: DispenserLimits
     leak: LeakLimits
     queue: QueueLimits
+    calib: CalibLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -301,6 +327,12 @@ class StationConfig:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        calib_section = limits.get("calib")
+        calib = (
+            CalibLimits.from_mapping(calib_section)
+            if isinstance(calib_section, Mapping)
+            else CalibLimits(1.5, 1.0, 86_400.0)
+        )
         return cls(
             name=name,
             storage_root=storage_root,
@@ -313,6 +345,7 @@ class StationConfig:
             dispenser=DispenserLimits.from_mapping(_section(limits, "disp")),
             leak=LeakLimits.from_mapping(_section(limits, "leak")),
             queue=QueueLimits.from_mapping(_section(limits, "queue")),
+            calib=calib,
         )
 
 
@@ -343,6 +376,7 @@ def default_config() -> StationConfig:
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
         queue=QueueLimits(12, 45.0),
+        calib=CalibLimits(1.5, 1.0, 86_400.0),
     )
 
 
@@ -403,6 +437,11 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+            },
+            "calib": {
+                "mpe_pct": cfg.calib.mpe_pct,
+                "min_charge_kg": cfg.calib.min_charge_kg,
+                "valid_ttl_s": cfg.calib.valid_ttl_s,
             },
         },
     }

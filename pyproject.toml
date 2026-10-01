@@ -22,6 +22,7 @@ packages = [
     "hydrorefuel.buffer",
     "hydrorefuel.cool",
     "hydrorefuel.flow",
+    "hydrorefuel.calib",
     "hydrorefuel.disp",
     "hydrorefuel.leak",
     "hydrorefuel.queue",

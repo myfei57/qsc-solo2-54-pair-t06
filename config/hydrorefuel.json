@@ -55,6 +55,11 @@
     "queue": {
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
+    },
+    "calib": {
+      "mpe_pct": 1.5,
+      "min_charge_kg": 1.0,
+      "valid_ttl_s": 86400.0
     }
   }
 }
